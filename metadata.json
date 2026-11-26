@@ -1,0 +1,6 @@
+{
+  "name": "星尘快递站",
+  "description": "太空快递站分拣街机小游戏：拖放发光星星包裹入舱，三连以上自动打包升空，清除黑洞危机，挑战90秒高分连击。",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
