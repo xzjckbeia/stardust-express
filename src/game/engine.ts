@@ -1,17 +1,26 @@
 import {
   BAY_MAX_CAPACITY,
+  FEVER_DURATION_SECONDS,
   PACK_FUSE_SECONDS,
   PACK_MIN_COUNT,
   ROUND_DURATION_SECONDS,
-  applyBlackholeRowSuck,
+  SLOWMO_BELT_FACTOR,
+  SLOWMO_DURATION_SECONDS,
+  applyBlackholePenalty,
+  applyParcelMissPenalty,
   applyPlaceParcel,
+  applyVipPackProgress,
   calculateBlackholeZapScore,
   calculatePackLaunchScore,
   canAcceptParcel,
   createInitialBays,
+  createRoundMission,
+  createVipOrder,
+  getRainbowChainAdjacentIndices,
   getWaveForElapsed,
   getWaveProgress,
-  pickNextParcelKind,
+  pickNextParcelSpec,
+  updateMissionProgress,
 } from './rules';
 import { drawBayIcon, drawParcelSprite, traceShapePath } from './shapes';
 import { SoundEngine } from './sound';
@@ -21,13 +30,16 @@ import {
   BayState,
   GamePhase,
   HudSnapshot,
+  MissionState,
   ParcelColor,
   ParcelKind,
+  VipOrderState,
 } from './types';
 
 interface ConveyorParcel {
   id: number;
   kind: ParcelKind;
+  isGolden5x: boolean;
   /** 0..1 normalized position along belt width */
   u: number;
   yOffset: number;
@@ -36,20 +48,19 @@ interface ConveyorParcel {
   scaleX: number;
   scaleY: number;
   spawnPop: number;
-  /** Blackhole live age & max lifetime before eruption (seconds) */
   age: number;
 }
 
-interface FlyingParcel {
+interface VisualFlyTrail {
   kind: ParcelColor | 'rainbow';
+  isGolden5x: boolean;
   startX: number;
   startY: number;
   targetX: number;
   targetY: number;
   t: number;
   duration: number;
-  targetBayIndex: number;
-  parcelId: number;
+  targetParcelId: number;
 }
 
 interface LaunchCrate {
@@ -60,7 +71,16 @@ interface LaunchCrate {
   vy: number;
   age: number;
   duration: number;
-  comboAtLaunch: number;
+}
+
+interface ChainArc {
+  fromX: number;
+  fromY: number;
+  toX: number;
+  toY: number;
+  color: string;
+  age: number;
+  life: number;
 }
 
 interface Particle {
@@ -85,16 +105,6 @@ interface FloatingText {
   subtext?: string;
   color: string;
   scale: number;
-  age: number;
-  life: number;
-}
-
-interface SuctionBeam {
-  fromX: number;
-  fromY: number;
-  toX: number;
-  toY: number;
-  color: string;
   age: number;
   life: number;
 }
@@ -126,6 +136,7 @@ interface DragState {
   pointerId: number;
   parcelId: number;
   kind: ParcelColor | 'rainbow';
+  isGolden5x: boolean;
   originU: number;
   startX: number;
   startY: number;
@@ -144,10 +155,14 @@ export interface EngineCallbacks {
     packedCount: number;
     packedParcels: number;
     blackholesCleared: number;
+    missionCompleted: boolean;
+    missionLabel: string;
+    vipCompletedCount: number;
   }) => void;
 }
 
-const PARTICLE_POOL_SIZE = 260;
+const PARTICLE_POOL_SIZE = 280;
+const VIP_SCHEDULE_SECONDS = [16, 44, 70];
 
 export class StardustEngine {
   private canvas: HTMLCanvasElement;
@@ -166,6 +181,9 @@ export class StardustEngine {
   private elapsed = 0;
   private currentWave: 1 | 2 | 3 = 1;
   private lastCountdownSec = 99;
+  private lastFeverTenth = -1;
+  private lastSlowmoTenth = -1;
+  private lastVipSec = -1;
 
   private score = 0;
   private combo = 0;
@@ -173,18 +191,28 @@ export class StardustEngine {
   private packedCount = 0;
   private packedParcels = 0;
   private blackholesCleared = 0;
+  private vipCompletedCount = 0;
+
+  private feverTimer = 0;
+  private slowmoTimer = 0;
+  private exitFlashTimer = 0;
+
+  private mission: MissionState | null = null;
+  private vipOrder: VipOrderState | null = null;
+  private nextVipScheduleIdx = 0;
+  private nextVipOrderId = 1;
 
   private nextParcelId = 1;
   private spawnTimer = 0;
   private ambientSpawnTimer = 0;
   private parcels: ConveyorParcel[] = [];
-  private flyingParcels: FlyingParcel[] = [];
+  private flyTrails: VisualFlyTrail[] = [];
   private launchCrates: LaunchCrate[] = [];
+  private chainArcs: ChainArc[] = [];
   private bays: BayState[] = createInitialBays();
   private particles: Particle[] = [];
   private particleCursor = 0;
   private floatingTexts: FloatingText[] = [];
-  private suctionBeams: SuctionBeam[] = [];
   private bgStars: BgStar[] = [];
 
   private hitstopTimer = 0;
@@ -194,7 +222,6 @@ export class StardustEngine {
 
   private drag: DragState | null = null;
   private selectedParcelId: number | null = null;
-  private lastHudPushTime = 0;
   private hudDirty = true;
 
   private layout: LayoutMetrics;
@@ -262,6 +289,7 @@ export class StardustEngine {
       this.parcels.push({
         id: this.nextParcelId++,
         kind: sampleKinds[i % sampleKinds.length],
+        isGolden5x: false,
         u: 0.14 + i * 0.22,
         yOffset: 0,
         bobPhase: i * 1.4,
@@ -333,22 +361,25 @@ export class StardustEngine {
 
   private computeLayout(width: number, height: number): LayoutMetrics {
     const isCompact = width < 680;
-    const hudReserve = isCompact ? 80 : 84;
+    // Extra headroom for Mission + VIP/Fever bar so conveyor never collides with top HUD
+    const hudReserve = isCompact ? 114 : 112;
     const sidePad = isCompact ? 12 : Math.max(32, Math.min(110, width * 0.08));
 
-    const beltHeight = isCompact ? Math.max(76, Math.min(92, height * 0.115)) : Math.max(96, Math.min(114, height * 0.13));
-    const beltY = hudReserve + beltHeight * 0.5 + (isCompact ? 10 : 12);
+    const beltHeight = isCompact
+      ? Math.max(74, Math.min(88, height * 0.11))
+      : Math.max(92, Math.min(110, height * 0.125));
+    const beltY = hudReserve + beltHeight * 0.5 + (isCompact ? 12 : 14);
     const beltLeft = sidePad;
     const beltRight = width - sidePad;
 
     const parcelRadius = isCompact
-      ? Math.max(22, Math.min(28, (width - 44) / 13.5))
-      : Math.max(28, Math.min(36, height * 0.04));
+      ? Math.max(22, Math.min(27, (width - 44) / 13.5))
+      : Math.max(28, Math.min(35, height * 0.039));
 
-    const bottomPad = isCompact ? 38 : 44;
+    const bottomPad = isCompact ? 34 : 40;
     const baysHeight = isCompact
-      ? Math.max(200, Math.min(258, height * 0.31))
-      : Math.max(230, Math.min(282, height * 0.32));
+      ? Math.max(204, Math.min(262, height * 0.315))
+      : Math.max(236, Math.min(290, height * 0.325));
     const baysTop = height - bottomPad - baysHeight;
 
     const baysAreaW = Math.min(width - sidePad * 2, isCompact ? width - 20 : 1040);
@@ -392,6 +423,7 @@ export class StardustEngine {
   }
 
   public destroy(): void {
+    this.sound.stopBgm();
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
@@ -404,11 +436,18 @@ export class StardustEngine {
     window.removeEventListener('blur', this.onWindowBlur);
   }
 
+  /**
+   * Maps viewport CSS coordinates into logical canvas layout coordinates,
+   * automatically normalizing against live getBoundingClientRect() scale.
+   */
   private screenToCanvas(clientX: number, clientY: number): { x: number; y: number } {
     const rect = this.canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return { x: clientX, y: clientY };
+    }
     return {
-      x: clientX - rect.left,
-      y: clientY - rect.top,
+      x: ((clientX - rect.left) / rect.width) * this.layout.width,
+      y: ((clientY - rect.top) / rect.height) * this.layout.height,
     };
   }
 
@@ -420,16 +459,15 @@ export class StardustEngine {
   }
 
   private findParcelAt(x: number, y: number): ConveyorParcel | null {
-    const hitRadius = this.layout.parcelRadius * (this.layout.isCompact ? 1.55 : 1.38);
+    const hitRadius = this.layout.parcelRadius * (this.layout.isCompact ? 1.6 : 1.44);
     let best: ConveyorParcel | null = null;
     let bestDist = hitRadius;
 
-    // Prioritize black holes when overlapping slightly so players can always zap danger cleanly
     for (const p of this.parcels) {
       if (this.drag && this.drag.parcelId === p.id) continue;
       const pos = this.getParcelPosition(p);
       const dist = Math.hypot(x - pos.x, y - pos.y);
-      const effectiveDist = p.kind === 'blackhole' ? dist * 0.85 : dist;
+      const effectiveDist = p.kind === 'blackhole' || p.kind === 'slowmo' ? dist * 0.85 : dist;
       if (effectiveDist < bestDist) {
         bestDist = effectiveDist;
         best = p;
@@ -440,18 +478,47 @@ export class StardustEngine {
 
   private findBayAt(x: number, y: number, generousVertical = false): number | null {
     const topThreshold = generousVertical
-      ? this.layout.baysTop - (this.layout.isCompact ? 68 : 82)
-      : this.layout.baysTop - 16;
+      ? this.layout.baysTop - (this.layout.isCompact ? 64 : 78)
+      : this.layout.baysTop - 22;
     if (y < topThreshold) return null;
 
     for (let i = 0; i < this.layout.bayRects.length; i++) {
       const r = this.layout.bayRects[i];
       const padX = this.layout.isCompact ? 6 : 12;
-      if (x >= r.x - padX && x <= r.x + r.w + padX && y <= r.y + r.h + 24) {
+      if (x >= r.x - padX && x <= r.x + r.w + padX && y <= r.y + r.h + 32) {
         return i;
       }
     }
     return null;
+  }
+
+  private pickAutoBayIndexForParcel(kind: ParcelColor | 'rainbow'): number {
+    if (kind !== 'rainbow') {
+      return BAY_SPECS.findIndex((b) => b.id === kind);
+    }
+    // Rainbow smart auto-target:
+    // 1) Any bay at 2 items (triggers Rainbow Chain Explosion!)
+    const twoIdx = this.bays.findIndex((b) => b.items.length === 2);
+    if (twoIdx !== -1) return twoIdx;
+    // 2) Active VIP order needed color with highest fill
+    if (this.vipOrder && !this.vipOrder.completed) {
+      for (const req of this.vipOrder.requirements) {
+        if (req.done < req.needed) {
+          const idx = this.bays.findIndex((b) => b.color === req.color);
+          if (idx !== -1) return idx;
+        }
+      }
+    }
+    // 3) Highest filled non-full bay
+    let bestIdx = 0;
+    let bestLen = -1;
+    for (let i = 0; i < this.bays.length; i++) {
+      if (this.bays[i].items.length > bestLen && this.bays[i].items.length < BAY_MAX_CAPACITY) {
+        bestLen = this.bays[i].items.length;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
   }
 
   private onPointerDown = (e: PointerEvent): void => {
@@ -460,11 +527,31 @@ export class StardustEngine {
 
     const { x, y } = this.screenToCanvas(e.clientX, e.clientY);
 
-    // 1. Check if tapping a parcel on the conveyor belt
+    // 1. If a parcel is already selected via tap, clicking ANY cargo bay routes it immediately!
+    if (this.selectedParcelId !== null) {
+      const bayIdx = this.findBayAt(x, y, true);
+      if (bayIdx !== null) {
+        this.sendParcelByIdToBay(this.selectedParcelId, bayIdx);
+        return;
+      }
+    }
+
+    // 2. Check if tapping a parcel on the conveyor belt
     const hitParcel = this.findParcelAt(x, y);
     if (hitParcel) {
       if (hitParcel.kind === 'blackhole') {
         this.zapBlackHole(hitParcel);
+        return;
+      }
+      if (hitParcel.kind === 'slowmo') {
+        this.activateSlowmo(hitParcel);
+        return;
+      }
+
+      // During Fever mode: single tap on ANY parcel immediately auto-flies it to its matching bay!
+      if (this.feverTimer > 0) {
+        const autoBay = this.pickAutoBayIndexForParcel(hitParcel.kind);
+        this.sendParcelByIdToBay(hitParcel.id, autoBay);
         return;
       }
 
@@ -476,6 +563,7 @@ export class StardustEngine {
         pointerId: e.pointerId,
         parcelId: hitParcel.id,
         kind: hitParcel.kind,
+        isGolden5x: hitParcel.isGolden5x,
         originU: hitParcel.u,
         startX: x,
         startY: y,
@@ -489,10 +577,10 @@ export class StardustEngine {
       return;
     }
 
-    // 2. If a parcel is already selected via quick tap, tapping a cargo bay sends it there!
-    const bayIdx = this.findBayAt(x, y, false);
-    if (bayIdx !== null && this.selectedParcelId !== null) {
-      this.sendParcelByIdToBay(this.selectedParcelId, bayIdx);
+    // 3. Clicking empty space deselects cleanly
+    if (this.selectedParcelId !== null) {
+      this.selectedParcelId = null;
+      this.hudDirty = true;
     }
   };
 
@@ -502,7 +590,7 @@ export class StardustEngine {
     this.drag.currX = x;
     this.drag.currY = y;
 
-    if (!this.drag.isDragging && Math.hypot(x - this.drag.startX, y - this.drag.startY) > 7) {
+    if (!this.drag.isDragging && Math.hypot(x - this.drag.startX, y - this.drag.startY) > 10) {
       this.drag.isDragging = true;
     }
 
@@ -523,7 +611,6 @@ export class StardustEngine {
       if (bayIdx !== null) {
         this.dropDraggedParcelInBay(drag, bayIdx);
       } else {
-        // Released back in space: parcel returns smoothly to conveyor
         const existing = this.parcels.find((p) => p.id === drag.parcelId);
         if (existing) {
           existing.scaleX = 0.86;
@@ -533,7 +620,7 @@ export class StardustEngine {
       this.selectedParcelId = null;
       this.hudDirty = true;
     }
-    // If not dragged (quick tap), keep selectedParcelId active so user can tap a bay!
+    // Quick tap (isDragging === false): keep selectedParcelId active so clicking a bay sends it!
   };
 
   private onPointerCancel = (e: PointerEvent): void => {
@@ -555,6 +642,9 @@ export class StardustEngine {
     this.elapsed = 0;
     this.currentWave = 1;
     this.lastCountdownSec = Math.ceil(this.duration);
+    this.lastFeverTenth = -1;
+    this.lastSlowmoTenth = -1;
+    this.lastVipSec = -1;
 
     this.score = 0;
     this.combo = 0;
@@ -562,36 +652,47 @@ export class StardustEngine {
     this.packedCount = 0;
     this.packedParcels = 0;
     this.blackholesCleared = 0;
+    this.vipCompletedCount = 0;
+
+    this.feverTimer = 0;
+    this.slowmoTimer = 0;
+    this.exitFlashTimer = 0;
+    this.mission = createRoundMission(Math.random);
+    this.vipOrder = null;
+    this.nextVipScheduleIdx = 0;
 
     this.parcels = [];
-    this.flyingParcels = [];
+    this.flyTrails = [];
     this.launchCrates = [];
+    this.chainArcs = [];
     this.bays = createInitialBays();
     this.floatingTexts = [];
-    this.suctionBeams = [];
     this.drag = null;
     this.selectedParcelId = null;
     this.hitstopTimer = 0;
     this.trauma = 0;
     this.screenFlashAlpha = 0;
-    this.spawnTimer = 0.2;
+    this.spawnTimer = 0.35;
 
-    // Reset particles cleanly
     for (const p of this.particles) p.active = false;
 
-    // Spawn 2 welcoming initial parcels immediately so the belt is alive at t=0
-    const starters: ParcelColor[] = ['gold', 'cyan'];
+    // Start upbeat procedural space BGM immediately on user start gesture!
+    this.sound.startBgm(1, 'normal');
+
+    // Spawn 3 brisk opening parcels immediately so there's zero dead air at t = 0
+    const starters: ParcelColor[] = ['gold', 'coral', 'cyan'];
     starters.forEach((c, i) => {
       this.parcels.push({
         id: this.nextParcelId++,
         kind: c,
+        isGolden5x: false,
         u: 0.08 + i * 0.16,
         yOffset: 0,
         bobPhase: Math.random() * Math.PI * 2,
         rotation: 0,
         scaleX: 1,
         scaleY: 1,
-        spawnPop: 0.4,
+        spawnPop: 0.5,
         age: 0,
       });
     });
@@ -602,11 +703,20 @@ export class StardustEngine {
   public setPhase(next: GamePhase): void {
     this.phase = next;
     this.drag = null;
+    if (next === 'playing') {
+      this.sound.startBgm(this.currentWave, this.feverTimer > 0 ? 'fever' : 'normal');
+    } else {
+      this.sound.stopBgm();
+    }
     if (next === 'title') {
       this.seedAmbientParcels();
       this.bays = createInitialBays();
-      this.flyingParcels = [];
+      this.flyTrails = [];
       this.launchCrates = [];
+      this.chainArcs = [];
+      this.feverTimer = 0;
+      this.slowmoTimer = 0;
+      this.vipOrder = null;
     }
     this.pushHudSnapshot(true);
   }
@@ -620,12 +730,14 @@ export class StardustEngine {
     if (bayIndex < 0 || bayIndex >= this.bays.length) return;
     this.sound.unlock();
 
-    // Use currently selected parcel, or pick the rightmost normal/rainbow parcel on belt
     let targetId = this.selectedParcelId;
-    if (targetId === null || !this.parcels.some((p) => p.id === targetId && p.kind !== 'blackhole')) {
+    if (
+      targetId === null ||
+      !this.parcels.some((p) => p.id === targetId && p.kind !== 'blackhole' && p.kind !== 'slowmo')
+    ) {
       let rightmost: ConveyorParcel | null = null;
       for (const p of this.parcels) {
-        if (p.kind === 'blackhole') continue;
+        if (p.kind === 'blackhole' || p.kind === 'slowmo') continue;
         if (!rightmost || p.u > rightmost.u) rightmost = p;
       }
       targetId = rightmost ? rightmost.id : null;
@@ -641,12 +753,44 @@ export class StardustEngine {
     this.sound.unlock();
     let urgent: ConveyorParcel | null = null;
     for (const p of this.parcels) {
-      if (p.kind !== 'blackhole') continue;
+      if (p.kind !== 'blackhole' && p.kind !== 'slowmo') continue;
       if (!urgent || p.u > urgent.u) urgent = p;
     }
     if (urgent) {
-      this.zapBlackHole(urgent);
+      if (urgent.kind === 'slowmo') this.activateSlowmo(urgent);
+      else this.zapBlackHole(urgent);
     }
+  }
+
+  /** Helper exposing active parcel positions in viewport CSS coords (useful for accessibility & E2E verification) */
+  public getDebugSnapshot(): {
+    parcels: { id: number; kind: ParcelKind; x: number; y: number }[];
+    bays: { color: ParcelColor; count: number; cx: number; cy: number }[];
+    selectedParcelId: number | null;
+    feverActive: boolean;
+  } {
+    const rect = this.canvas.getBoundingClientRect();
+    const sx = rect.width / Math.max(1, this.layout.width);
+    const sy = rect.height / Math.max(1, this.layout.height);
+    return {
+      parcels: this.parcels.map((p) => {
+        const pos = this.getParcelPosition(p);
+        return {
+          id: p.id,
+          kind: p.kind,
+          x: Math.round(rect.left + pos.x * sx),
+          y: Math.round(rect.top + pos.y * sy),
+        };
+      }),
+      bays: this.bays.map((b, i) => ({
+        color: b.color,
+        count: b.items.length,
+        cx: Math.round(rect.left + this.layout.bayRects[i].cx * sx),
+        cy: Math.round(rect.top + this.layout.bayRects[i].cy * sy),
+      })),
+      selectedParcelId: this.selectedParcelId,
+      feverActive: this.feverTimer > 0,
+    };
   }
 
   // --- Core Gameplay Actions ---
@@ -663,13 +807,16 @@ export class StardustEngine {
       this.zapBlackHole(parcel);
       return;
     }
+    if (parcel.kind === 'slowmo') {
+      this.activateSlowmo(parcel);
+      return;
+    }
 
     const bay = this.bays[bayIndex];
     const bayRect = this.layout.bayRects[bayIndex];
     const startPos = this.getParcelPosition(parcel);
 
     if (!canAcceptParcel(bay.color, parcel.kind)) {
-      // Clear reject feedback without stealing the parcel off the belt
       bay.rejectTimer = 0.35;
       this.combo = 0;
       this.trauma = Math.min(1, this.trauma + 0.22);
@@ -680,24 +827,26 @@ export class StardustEngine {
       return;
     }
 
-    // Remove from belt and fly smoothly into the bay
+    // Remove from conveyor, clear selection, launch crisp visual arc, AND commit immediately
+    // so score/combo/bay count update instantaneously with zero race conditions!
     this.parcels.splice(idx, 1);
     this.selectedParcelId = null;
-    this.sound.playPickup();
 
-    const targetSlotPos = this.getBaySlotCenter(bayIndex, Math.min(bay.items.length, BAY_MAX_CAPACITY - 1));
-    this.flyingParcels.push({
+    const targetSlotIndex = Math.min(bay.items.length, BAY_MAX_CAPACITY - 1);
+    const targetSlotPos = this.getBaySlotCenter(bayIndex, targetSlotIndex);
+    this.flyTrails.push({
       kind: parcel.kind,
+      isGolden5x: parcel.isGolden5x,
       startX: startPos.x,
       startY: startPos.y,
       targetX: targetSlotPos.x,
       targetY: targetSlotPos.y,
       t: 0,
-      duration: 0.16,
-      targetBayIndex: bayIndex,
-      parcelId: parcel.id,
+      duration: 0.13,
+      targetParcelId: parcel.id,
     });
-    this.hudDirty = true;
+
+    this.commitParcelIntoBay(bayIndex, parcel.id, parcel.kind, parcel.isGolden5x);
   }
 
   private dropDraggedParcelInBay(drag: DragState, bayIndex: number): void {
@@ -718,17 +867,24 @@ export class StardustEngine {
       return;
     }
 
-    // Remove from conveyor and commit into bay
     this.parcels.splice(idx, 1);
-    this.commitParcelIntoBay(bayIndex, drag.parcelId, drag.kind);
+    this.commitParcelIntoBay(bayIndex, drag.parcelId, drag.kind, drag.isGolden5x);
   }
 
-  private commitParcelIntoBay(bayIndex: number, parcelId: number, kind: ParcelColor | 'rainbow'): void {
+  private commitParcelIntoBay(
+    bayIndex: number,
+    parcelId: number,
+    kind: ParcelColor | 'rainbow',
+    isGolden5x: boolean
+  ): void {
     const bay = this.bays[bayIndex];
     const bayRect = this.layout.bayRects[bayIndex];
     const spec = BAY_SPEC_MAP[bay.color];
 
-    const res = applyPlaceParcel(bay, parcelId, kind, this.combo);
+    const res = applyPlaceParcel(bay, parcelId, kind, this.combo, {
+      isGolden5x,
+      isFever: this.feverTimer > 0,
+    });
     if (!res.accepted) {
       this.sound.playReject();
       this.hudDirty = true;
@@ -738,65 +894,136 @@ export class StardustEngine {
     this.combo = res.nextCombo;
     this.maxCombo = Math.max(this.maxCombo, this.combo);
     this.score += res.placePoints;
-    this.sound.playSlotIn(this.combo, kind === 'rainbow');
+
+    if (res.triggeredFever) {
+      this.triggerFeverMode();
+    }
+
+    this.sound.playSlotIn(this.combo, kind === 'rainbow', isGolden5x);
 
     const slotPos = this.getBaySlotCenter(bayIndex, Math.max(0, res.newCount - 1));
-    const comboHeat = Math.min(1.8, 1 + this.combo * 0.06);
+    const comboHeat = Math.min(2.0, 1 + this.combo * 0.08);
     this.spawnBurst(
       slotPos.x,
       slotPos.y,
-      kind === 'rainbow' ? '#FFFFFF' : spec.bright,
-      Math.round(7 * comboHeat),
+      isGolden5x ? '#FFE066' : kind === 'rainbow' ? '#FFFFFF' : spec.bright,
+      Math.round((isGolden5x ? 18 : 8) * comboHeat),
       comboHeat
     );
 
-    if (res.instantOverchargePack) {
-      this.launchBayPack(bayIndex);
-    } else if (res.triggeredFuse) {
-      this.spawnFloatingText(bayRect.cx, bayRect.y - 12, '三连就绪!', undefined, spec.bright, 0.92);
+    if (isGolden5x) {
+      this.spawnShockwave(slotPos.x, slotPos.y, '#FFE066', 54);
+      this.spawnFloatingText(slotPos.x, slotPos.y - 26, `+${res.placePoints}`, '金色 ×5 爆发!', '#FFE066', 1.2);
+    } else if (!res.instantOverchargePack) {
+      const sub = res.newCount === 2 ? '再1个就打包!' : undefined;
+      this.spawnFloatingText(slotPos.x, slotPos.y - 22, `+${res.placePoints}`, sub, spec.bright, 0.96);
     }
 
+    if (res.triggeredRainbowChain) {
+      this.triggerRainbowChainExplosion(bayIndex);
+    } else if (res.instantOverchargePack) {
+      this.launchBayPack(bayIndex, false);
+    } else if (res.triggeredFuse) {
+      this.spawnFloatingText(bayRect.cx, bayRect.y - 16, '三连打包!', undefined, spec.bright, 0.96);
+    }
+
+    this.checkMissionProgress();
     this.hudDirty = true;
   }
 
-  private launchBayPack(bayIndex: number): void {
+  private triggerFeverMode(): void {
+    this.feverTimer = FEVER_DURATION_SECONDS;
+    this.lastFeverTenth = Math.ceil(this.feverTimer * 10);
+    this.sound.playFeverStart();
+    this.sound.setBgmMode('fever');
+    this.trauma = Math.min(1, this.trauma + 0.35);
+    this.screenFlashColor = '#FFD166';
+    this.screenFlashAlpha = 0.28;
+
+    const cx = this.layout.width * 0.5;
+    const cy = (this.layout.beltY + this.layout.baysTop) * 0.5;
+    this.spawnShockwave(cx, cy, '#FFD166', 140);
+    this.spawnBurst(cx, cy, '#FFE066', 32, 1.8);
+    this.spawnFloatingText(cx, cy - 12, 'FEVER 狂热模式!', '得分×2 · 轻点任意包裹秒入舱!', '#FFE066', 1.32);
+    this.hudDirty = true;
+  }
+
+  private triggerRainbowChainExplosion(centerBayIndex: number): void {
+    const centerRect = this.layout.bayRects[centerBayIndex];
+    this.sound.playRainbowChain();
+    this.spawnShockwave(centerRect.cx, centerRect.cy, '#FFFFFF', 105);
+
+    // First launch center bay immediately
+    this.launchBayPack(centerBayIndex, false);
+
+    // Detonate adjacent bays!
+    const neighbors = getRainbowChainAdjacentIndices(centerBayIndex, this.bays.length);
+    for (const adjIdx of neighbors) {
+      const adjBay = this.bays[adjIdx];
+      const adjRect = this.layout.bayRects[adjIdx];
+      this.chainArcs.push({
+        fromX: centerRect.cx,
+        fromY: centerRect.cy,
+        toX: adjRect.cx,
+        toY: adjRect.cy,
+        color: '#FFE066',
+        age: 0,
+        life: 0.42,
+      });
+
+      if (adjBay.items.length > 0) {
+        this.launchBayPack(adjIdx, true);
+      } else {
+        // Empty adjacent bay still gets dazzling prismatic FX
+        adjBay.launchPulse = 0.85;
+        this.spawnBurst(adjRect.cx, adjRect.cy, '#7DF0FF', 16, 1.3);
+        this.spawnShockwave(adjRect.cx, adjRect.cy, '#E879F9', 60);
+      }
+    }
+  }
+
+  private launchBayPack(bayIndex: number, isChainBonus = false): void {
     const bay = this.bays[bayIndex];
-    if (bay.items.length < PACK_MIN_COUNT) {
+    if (!isChainBonus && bay.items.length < PACK_MIN_COUNT) {
+      bay.packFuse = null;
+      return;
+    }
+    if (bay.items.length === 0) {
       bay.packFuse = null;
       return;
     }
 
     const spec = BAY_SPEC_MAP[bay.color];
     const bayRect = this.layout.bayRects[bayIndex];
-    const waveCfg = getWaveForElapsed(this.elapsed);
-    const launchRes = calculatePackLaunchScore(bay.items, this.combo, waveCfg.wave);
 
-    this.combo = launchRes.nextCombo;
-    this.maxCombo = Math.max(this.maxCombo, this.combo);
+    const vipRes = applyVipPackProgress(this.vipOrder, bay.color);
+    const launchRes = calculatePackLaunchScore(bay.items, {
+      isFever: this.feverTimer > 0,
+      isVipMatch: vipRes.matched,
+      isChainBonus,
+    });
+
     this.score += launchRes.points;
     this.packedCount += 1;
     this.packedParcels += launchRes.count;
 
-    // Clear bay slots and trigger juicy rocket launch visual
     bay.items = [];
     bay.packFuse = null;
     bay.launchPulse = 1.0;
 
-    // Weight-scaled juice: brighter bursts & crisp hitstop at higher combos / overcharges
-    const intensity = Math.min(2.4, 1 + this.combo * 0.09 + (launchRes.count - 3) * 0.35);
-    this.hitstopTimer = Math.min(0.055, 0.024 + (launchRes.count - 3) * 0.012);
-    this.trauma = Math.min(1, this.trauma + 0.24 * Math.min(1.6, intensity));
-    this.screenFlashColor = spec.bright;
-    this.screenFlashAlpha = Math.min(0.24, 0.08 + this.combo * 0.01);
+    const intensity = Math.min(2.5, 1.05 + this.combo * 0.09 + (launchRes.vipApplied ? 0.5 : 0));
+    this.hitstopTimer = Math.min(0.055, 0.025 + (launchRes.count >= 4 ? 0.015 : 0));
+    this.trauma = Math.min(1, this.trauma + 0.25 * Math.min(1.6, intensity));
+    this.screenFlashColor = launchRes.vipApplied ? '#FFE066' : spec.bright;
+    this.screenFlashAlpha = Math.min(0.24, 0.09 + this.combo * 0.01);
 
     this.sound.playPackLaunch(this.combo, launchRes.count);
 
-    // Big starburst explosion + shockwave rings
-    this.spawnBurst(bayRect.cx, bayRect.cy - 10, spec.bright, Math.round(18 * intensity), intensity);
-    this.spawnBurst(bayRect.cx, bayRect.cy - 10, '#FFFFFF', Math.round(8 * intensity), intensity * 1.15);
-    this.spawnShockwave(bayRect.cx, bayRect.cy - 10, spec.primary, 48 * intensity);
-    if (this.combo >= 5 || launchRes.count >= 4) {
-      this.spawnShockwave(bayRect.cx, bayRect.cy - 10, '#FFFFFF', 72 * intensity);
+    this.spawnBurst(bayRect.cx, bayRect.cy - 10, spec.bright, Math.round(20 * intensity), intensity);
+    this.spawnBurst(bayRect.cx, bayRect.cy - 10, '#FFFFFF', Math.round(9 * intensity), intensity * 1.15);
+    this.spawnShockwave(bayRect.cx, bayRect.cy - 10, spec.primary, 52 * intensity);
+    if (this.combo >= 5 || launchRes.vipApplied || isChainBonus) {
+      this.spawnShockwave(bayRect.cx, bayRect.cy - 10, '#FFE066', 78 * intensity);
     }
 
     this.launchCrates.push({
@@ -807,17 +1034,36 @@ export class StardustEngine {
       vy: -560,
       age: 0,
       duration: 0.65,
-      comboAtLaunch: this.combo,
     });
 
     const headline = `+${launchRes.points}`;
-    const sub = launchRes.overchargeLabel
-      ? `${launchRes.overchargeLabel} · 连击 x${this.combo}`
-      : this.combo >= 3
-        ? `打包发车 · 连击 x${this.combo}`
-        : '打包发车!';
-    this.spawnFloatingText(bayRect.cx, bayRect.y - 14, headline, sub, spec.bright, Math.min(1.38, 1 + this.combo * 0.03));
+    const tags: string[] = [];
+    if (launchRes.vipApplied) tags.push('VIP ×3');
+    if (launchRes.feverApplied) tags.push('FEVER ×2');
+    if (launchRes.overchargeLabel) tags.push(launchRes.overchargeLabel);
+    else if (tags.length === 0) tags.push('三连打包奖励');
 
+    this.spawnFloatingText(
+      bayRect.cx,
+      bayRect.y - 16,
+      headline,
+      tags.join(' · '),
+      launchRes.vipApplied ? '#FFE066' : spec.bright,
+      Math.min(1.4, 1.04 + (launchRes.vipApplied ? 0.16 : 0))
+    );
+
+    if (vipRes.orderCompleted) {
+      this.vipCompletedCount += 1;
+      this.sound.playVipComplete();
+      const cx = this.layout.width * 0.5;
+      const cy = this.layout.beltY + 72;
+      this.spawnBurst(cx, cy, '#FFE066', 28, 1.6);
+      this.spawnFloatingText(cx, cy, 'VIP 急单达成!', '3倍打包分已到手', '#FFE066', 1.25);
+      // Keep completed banner visible briefly via a short visual decay? Clear immediately so next is clean
+      this.vipOrder = null;
+    }
+
+    this.checkMissionProgress();
     this.hudDirty = true;
   }
 
@@ -828,58 +1074,93 @@ export class StardustEngine {
     const pos = this.getParcelPosition(parcel);
     this.parcels.splice(idx, 1);
 
-    const waveCfg = getWaveForElapsed(this.elapsed);
-    const zap = calculateBlackholeZapScore(this.combo, waveCfg.wave);
+    const zap = calculateBlackholeZapScore(this.combo, this.feverTimer > 0);
     this.combo = zap.nextCombo;
     this.maxCombo = Math.max(this.maxCombo, this.combo);
     this.score += zap.points;
     this.blackholesCleared += 1;
 
-    this.hitstopTimer = 0.032;
-    this.trauma = Math.min(1, this.trauma + 0.25);
+    if (zap.triggeredFever) {
+      this.triggerFeverMode();
+    }
+
+    this.hitstopTimer = 0.028;
+    this.trauma = Math.min(1, this.trauma + 0.22);
     this.sound.playBlackholeZap(this.combo);
 
-    this.spawnBurst(pos.x, pos.y, '#E879F9', 22, 1.35);
-    this.spawnBurst(pos.x, pos.y, '#FFFFFF', 10, 1.15);
-    this.spawnShockwave(pos.x, pos.y, '#E879F9', 64);
-    this.spawnFloatingText(pos.x, pos.y - 24, `黑洞清除 +${zap.points}`, `连击 x${this.combo}`, '#F5A3FF', 1.08);
+    this.spawnBurst(pos.x, pos.y, '#E879F9', 20, 1.3);
+    this.spawnBurst(pos.x, pos.y, '#FFFFFF', 9, 1.1);
+    this.spawnShockwave(pos.x, pos.y, '#E879F9', 60);
+    this.spawnFloatingText(pos.x, pos.y - 24, `黑洞清除 +${zap.points}`, `连击 x${this.combo}`, '#F5A3FF', 1.02);
 
+    this.checkMissionProgress();
     this.hudDirty = true;
   }
 
+  private activateSlowmo(parcel: ConveyorParcel): void {
+    const idx = this.parcels.findIndex((p) => p.id === parcel.id);
+    if (idx === -1) return;
+
+    const pos = this.getParcelPosition(parcel);
+    this.parcels.splice(idx, 1);
+
+    this.slowmoTimer = SLOWMO_DURATION_SECONDS;
+    this.lastSlowmoTenth = Math.ceil(this.slowmoTimer * 10);
+    this.sound.playSlowmoActivate();
+    this.screenFlashColor = '#7DD3FC';
+    this.screenFlashAlpha = 0.2;
+
+    this.spawnBurst(pos.x, pos.y, '#7DD3FC', 22, 1.35);
+    this.spawnShockwave(pos.x, pos.y, '#38BDF8', 75);
+    this.spawnFloatingText(pos.x, pos.y - 24, '时空减速 5秒!', '传送带速度减半', '#7DD3FC', 1.15);
+    this.hudDirty = true;
+  }
+
+  /**
+   * Black hole eruption NO LONGER steals items from cargo bays!
+   * Only breaks combo and deducts 25 points (floored at 0).
+   */
   private triggerBlackHoleEruption(x: number, y: number): void {
-    const suck = applyBlackholeRowSuck(this.bays);
-    this.combo = 0;
-    this.hitstopTimer = 0.055;
-    this.trauma = Math.min(1, this.trauma + 0.65);
+    const res = applyBlackholePenalty(this.score);
+    this.score = res.nextScore;
+    this.combo = res.nextCombo;
+    this.hitstopTimer = 0.045;
+    this.trauma = Math.min(1, this.trauma + 0.45);
     this.screenFlashColor = '#A855F7';
-    this.screenFlashAlpha = 0.26;
+    this.screenFlashAlpha = 0.22;
+    this.exitFlashTimer = 0.45;
     this.sound.playBlackholeSuck();
 
-    this.spawnShockwave(x, y, '#FF3366', 110);
-    this.spawnBurst(x, y, '#A855F7', 26, 1.4);
+    this.spawnShockwave(x, y, '#FF3366', 92);
+    this.spawnBurst(x, y, '#C084FC', 24, 1.35);
 
-    // Draw dramatic suction beams from every affected bay's bottom row into the black hole
-    for (let i = 0; i < this.bays.length; i++) {
-      const bay = this.bays[i];
-      if (suck.affectedBays.includes(bay.color)) {
-        const slotPos = this.getBaySlotCenter(i, 0);
-        this.suctionBeams.push({
-          fromX: slotPos.x,
-          fromY: slotPos.y,
-          toX: x,
-          toY: y,
-          color: BAY_SPEC_MAP[bay.color].bright,
-          age: 0,
-          life: 0.48,
-        });
-        this.spawnBurst(slotPos.x, slotPos.y, '#C084FC', 12, 1.0);
-      }
-    }
-
-    const msg = suck.suckedCount > 0 ? `黑洞吸走 ${suck.suckedCount} 件货!` : '黑洞爆发 · 连击中断';
-    this.spawnFloatingText(this.layout.width * 0.5, this.layout.beltY + 70, msg, undefined, '#FF75A0', 1.18);
+    const msg = res.deducted > 0 ? `黑洞干扰 -${res.deducted}` : '黑洞干扰 · 连击中断';
+    this.spawnFloatingText(
+      Math.min(this.layout.width - 110, x - 20),
+      this.layout.beltY + 56,
+      msg,
+      '货舱进度已保全',
+      '#F472B6',
+      1.1
+    );
     this.hudDirty = true;
+  }
+
+  private checkMissionProgress(): void {
+    if (!this.mission || this.mission.completed) return;
+    const { newlyCompleted } = updateMissionProgress(this.mission, {
+      packedCount: this.packedCount,
+      blackholesCleared: this.blackholesCleared,
+      score: this.score,
+    });
+    if (newlyCompleted) {
+      this.score += this.mission.reward;
+      this.sound.playMissionComplete();
+      const cx = this.layout.width * 0.5;
+      this.spawnFloatingText(cx, this.layout.beltY + 46, `任务达成 +${this.mission.reward}`, this.mission.label, '#6BFFB8', 1.18);
+      this.spawnBurst(cx, this.layout.beltY + 46, '#6BFFB8', 22, 1.35);
+      this.hudDirty = true;
+    }
   }
 
   // --- Particle & FX Pools ---
@@ -940,7 +1221,7 @@ export class StardustEngine {
     color: string,
     scale = 1
   ): void {
-    const safeX = Math.max(76, Math.min(this.layout.width - 76, x));
+    const safeX = Math.max(82, Math.min(this.layout.width - 82, x));
     this.floatingTexts.push({
       x: safeX,
       y,
@@ -956,10 +1237,9 @@ export class StardustEngine {
 
   private getBaySlotCenter(bayIndex: number, slotIndex: number): { x: number; y: number } {
     const r = this.layout.bayRects[bayIndex];
-    const headerH = this.layout.isCompact ? 50 : 58;
-    const footerH = 22;
+    const headerH = this.layout.isCompact ? 48 : 54;
+    const footerH = 24;
     const usableH = r.h - headerH - footerH;
-    // Arrange slots vertically from bottom (row 0) upward so row 0 aligns cleanly across all 4 bays
     const row = Math.min(slotIndex, 4);
     if (row < 3) {
       const spacing = usableH / 3;
@@ -968,7 +1248,6 @@ export class StardustEngine {
         y: r.y + r.h - footerH - spacing * (row + 0.5),
       };
     }
-    // Overcharge slots 4 & 5 nest neatly slightly offset at top of bay
     const offset = row === 3 ? -r.w * 0.2 : r.w * 0.2;
     return {
       x: r.cx + offset,
@@ -985,19 +1264,19 @@ export class StardustEngine {
       this.lastTimestamp = ts;
       const dt = Math.min(Math.max(rawDt, 0.001), 0.05);
 
-      this.update(dt, ts);
+      this.update(dt);
       this.render();
       this.rafId = requestAnimationFrame(step);
     };
     this.rafId = requestAnimationFrame(step);
   }
 
-  private update(dt: number, nowMs: number): void {
+  private update(dt: number): void {
     this.animTime += dt;
 
-    // Camera trauma & hit flash always decay in real time
     this.trauma = Math.max(0, this.trauma - dt * 1.9);
     this.screenFlashAlpha = Math.max(0, this.screenFlashAlpha - dt * 1.15);
+    this.exitFlashTimer = Math.max(0, this.exitFlashTimer - dt);
 
     if (this.phase === 'title') {
       this.updateAmbientTitle(dt);
@@ -1010,7 +1289,6 @@ export class StardustEngine {
       return;
     }
 
-    // Hitstop freezes gameplay simulation briefly while keeping particles/shake crisp
     if (this.hitstopTimer > 0) {
       this.hitstopTimer = Math.max(0, this.hitstopTimer - dt);
       this.updateParticles(dt * 0.45);
@@ -1021,7 +1299,6 @@ export class StardustEngine {
     this.elapsed += dt;
     const timeLeft = Math.max(0, this.duration - this.elapsed);
 
-    // Final 5-second countdown ticks
     const secCeil = Math.ceil(timeLeft);
     if (secCeil !== this.lastCountdownSec) {
       this.lastCountdownSec = secCeil;
@@ -1031,10 +1308,64 @@ export class StardustEngine {
       this.hudDirty = true;
     }
 
-    // Check wave progression (0s -> W1, 30s -> W2, 60s -> W3)
+    // Update Fever timer (8s)
+    if (this.feverTimer > 0) {
+      this.feverTimer = Math.max(0, this.feverTimer - dt);
+      const tenth = Math.ceil(this.feverTimer * 10);
+      if (tenth !== this.lastFeverTenth) {
+        this.lastFeverTenth = tenth;
+        this.hudDirty = true;
+      }
+      if (this.feverTimer <= 0) {
+        this.sound.setBgmMode('normal');
+        this.combo = 0; // Fresh build toward next Fever!
+        this.hudDirty = true;
+      }
+    }
+
+    // Update Slow-Mo timer (5s)
+    if (this.slowmoTimer > 0) {
+      this.slowmoTimer = Math.max(0, this.slowmoTimer - dt);
+      const tenth = Math.ceil(this.slowmoTimer * 10);
+      if (tenth !== this.lastSlowmoTenth) {
+        this.lastSlowmoTenth = tenth;
+        this.hudDirty = true;
+      }
+    }
+
+    // Schedule VIP Timed Orders (at 16s, 44s, 70s -> >= 2 per 90s round!)
+    if (
+      !this.vipOrder &&
+      this.nextVipScheduleIdx < VIP_SCHEDULE_SECONDS.length &&
+      this.elapsed >= VIP_SCHEDULE_SECONDS[this.nextVipScheduleIdx] &&
+      timeLeft >= 10
+    ) {
+      this.vipOrder = createVipOrder(this.nextVipOrderId++, Math.random);
+      this.nextVipScheduleIdx += 1;
+      this.lastVipSec = Math.ceil(this.vipOrder.timeLeft);
+      this.sound.playPickup();
+      this.hudDirty = true;
+    }
+
+    if (this.vipOrder) {
+      this.vipOrder.timeLeft = Math.max(0, this.vipOrder.timeLeft - dt);
+      const vSec = Math.ceil(this.vipOrder.timeLeft);
+      if (vSec !== this.lastVipSec) {
+        this.lastVipSec = vSec;
+        this.hudDirty = true;
+      }
+      if (this.vipOrder.timeLeft <= 0) {
+        // Silent fade-out with zero penalty
+        this.vipOrder = null;
+        this.hudDirty = true;
+      }
+    }
+
+    // Wave progression (0s -> W1, 30s -> W2, 60s -> W3)
     const waveCfg = getWaveForElapsed(this.elapsed);
     if (waveCfg.wave !== this.currentWave) {
       this.currentWave = waveCfg.wave;
+      this.sound.setBgmWave(waveCfg.wave);
       if (waveCfg.wave === 2 || waveCfg.wave === 3) {
         this.sound.playWaveUp(waveCfg.wave);
       }
@@ -1044,15 +1375,15 @@ export class StardustEngine {
 
     // Check round end
     if (this.elapsed >= this.duration) {
-      // Auto-launch any bay already at 3+ parcels before finalizing score!
       for (let i = 0; i < this.bays.length; i++) {
         if (this.bays[i].items.length >= PACK_MIN_COUNT) {
-          this.launchBayPack(i);
+          this.launchBayPack(i, false);
         }
       }
       this.phase = 'gameover';
       this.drag = null;
       this.selectedParcelId = null;
+      this.sound.stopBgm();
       this.sound.playRoundEnd();
       this.pushHudSnapshot(true);
       this.callbacks.onRoundComplete({
@@ -1061,24 +1392,38 @@ export class StardustEngine {
         packedCount: this.packedCount,
         packedParcels: this.packedParcels,
         blackholesCleared: this.blackholesCleared,
+        missionCompleted: Boolean(this.mission?.completed),
+        missionLabel: this.mission?.label ?? '',
+        vipCompletedCount: this.vipCompletedCount,
       });
       return;
     }
 
-    // Scroll conveyor belt visuals in sync with wave speed
+    // Belt speed with Slow-Mo multiplier
+    const slowMult = this.slowmoTimer > 0 ? SLOWMO_BELT_FACTOR : 1.0;
     const beltWidth = this.layout.beltRight - this.layout.beltLeft;
-    this.beltScroll += beltWidth * waveCfg.beltSpeedRatio * dt;
+    this.beltScroll += beltWidth * waveCfg.beltSpeedRatio * slowMult * dt;
 
-    // Spawn parcels smoothly
+    // Spawn parcels smoothly (smart biased toward 2/3 bays, floods rainbows in Fever)
     this.spawnTimer -= dt;
     if (this.spawnTimer <= 0) {
       const hasCrowdAtEntry = this.parcels.some((p) => p.u < 0.11);
       if (!hasCrowdAtEntry) {
         const activeBlackholes = this.parcels.filter((p) => p.kind === 'blackhole').length;
-        const kind = pickNextParcelKind(this.elapsed, waveCfg, Math.random, activeBlackholes);
+        const activeSlowmo = this.slowmoTimer > 0 || this.parcels.some((p) => p.kind === 'slowmo');
+        const spec = pickNextParcelSpec(
+          this.elapsed,
+          waveCfg,
+          this.bays,
+          this.feverTimer > 0,
+          Math.random,
+          activeBlackholes,
+          activeSlowmo
+        );
         this.parcels.push({
           id: this.nextParcelId++,
-          kind,
+          kind: spec.kind,
+          isGolden5x: spec.isGolden5x,
           u: -0.02,
           yOffset: 0,
           bobPhase: Math.random() * Math.PI * 2,
@@ -1088,12 +1433,13 @@ export class StardustEngine {
           spawnPop: 0,
           age: 0,
         });
-        if (kind === 'blackhole') {
+        if (spec.kind === 'blackhole') {
           this.sound.playBlackholeSpawn();
         }
-        this.spawnTimer = waveCfg.spawnInterval * (0.88 + Math.random() * 0.24);
+        const feverSpawnFactor = this.feverTimer > 0 ? 0.68 : 1.0;
+        this.spawnTimer = waveCfg.spawnInterval * feverSpawnFactor * (0.86 + Math.random() * 0.24);
       } else {
-        this.spawnTimer = 0.14;
+        this.spawnTimer = 0.12;
       }
     }
 
@@ -1106,9 +1452,14 @@ export class StardustEngine {
       p.scaleY += (1 - p.scaleY) * Math.min(1, dt * 14);
 
       const isBeingDragged = this.drag && this.drag.parcelId === p.id && this.drag.isDragging;
+      const isSelected = this.selectedParcelId === p.id;
       if (!isBeingDragged) {
-        const speedMult = p.kind === 'blackhole' ? 0.92 : 1.0;
-        p.u += waveCfg.beltSpeedRatio * speedMult * dt;
+        const kindMult = p.kind === 'blackhole' ? 0.92 : isSelected ? 0.28 : 1.0;
+        p.u += waveCfg.beltSpeedRatio * slowMult * kindMult * dt;
+        // Magnetic clamp while selected so parcel never vanishes mid-click while moving pointer to bay
+        if (isSelected && p.u > 0.95) {
+          p.u = 0.95;
+        }
       }
 
       if (p.u >= 1.02) {
@@ -1116,6 +1467,7 @@ export class StardustEngine {
         this.parcels.splice(i, 1);
         if (this.selectedParcelId === p.id) {
           this.selectedParcelId = null;
+          this.hudDirty = true;
         }
         if (this.drag && this.drag.parcelId === p.id) {
           this.drag = null;
@@ -1123,25 +1475,28 @@ export class StardustEngine {
 
         if (p.kind === 'blackhole') {
           this.triggerBlackHoleEruption(pos.x, pos.y);
+        } else if (p.kind === 'slowmo') {
+          // Powerup simply leaves without penalty
         } else {
-          // Missed regular parcel drifts away & resets combo
-          if (this.combo > 0) {
-            this.combo = 0;
-            this.sound.playMiss();
-            this.spawnFloatingText(this.layout.beltRight - 36, this.layout.beltY + 34, '漏件', undefined, '#94A3B8', 0.85);
-            this.hudDirty = true;
-          }
+          // Missed regular/rainbow/golden parcel: ALWAYS give visible feedback, break combo, deduct 10 pts
+          const miss = applyParcelMissPenalty(this.score);
+          this.score = miss.nextScore;
+          this.combo = miss.nextCombo;
+          this.exitFlashTimer = 0.35;
+          this.sound.playMiss();
+          const sub = miss.deducted > 0 ? `-${miss.deducted} 分` : '断连击';
+          this.spawnFloatingText(this.layout.beltRight - 46, this.layout.beltY + 42, '漏掉了！', sub, '#FF758F', 1.02);
+          this.hudDirty = true;
         }
       }
     }
 
-    // Update flying parcels (tap-to-bay arcs)
-    for (let i = this.flyingParcels.length - 1; i >= 0; i--) {
-      const f = this.flyingParcels[i];
+    // Update visual flight trails (purely cosmetic; bay state already updated cleanly)
+    for (let i = this.flyTrails.length - 1; i >= 0; i--) {
+      const f = this.flyTrails[i];
       f.t += dt / f.duration;
       if (f.t >= 1) {
-        this.flyingParcels.splice(i, 1);
-        this.commitParcelIntoBay(f.targetBayIndex, f.parcelId, f.kind);
+        this.flyTrails.splice(i, 1);
       }
     }
 
@@ -1153,13 +1508,13 @@ export class StardustEngine {
       bay.launchPulse = Math.max(0, bay.launchPulse - dt * 2.2);
 
       for (const item of bay.items) {
-        item.pop = Math.min(1, item.pop + dt * 7);
+        item.pop = Math.min(1, item.pop + dt * 7.5);
       }
 
       if (bay.packFuse !== null) {
         bay.packFuse -= dt;
         if (bay.packFuse <= 0) {
-          this.launchBayPack(i);
+          this.launchBayPack(i, false);
         }
       }
     }
@@ -1192,7 +1547,6 @@ export class StardustEngine {
 
     if (this.hudDirty) {
       this.pushHudSnapshot(false);
-      this.lastHudPushTime = nowMs;
       this.hudDirty = false;
     }
   }
@@ -1215,6 +1569,7 @@ export class StardustEngine {
       this.parcels.push({
         id: this.nextParcelId++,
         kind: kinds[this.nextParcelId % kinds.length],
+        isGolden5x: false,
         u: -0.04,
         yOffset: 0,
         bobPhase: Math.random() * Math.PI * 2,
@@ -1224,7 +1579,7 @@ export class StardustEngine {
         spawnPop: 1,
         age: 0,
       });
-      this.ambientSpawnTimer = 2.1;
+      this.ambientSpawnTimer = 2.0;
     }
   }
 
@@ -1259,11 +1614,11 @@ export class StardustEngine {
       }
     }
 
-    for (let i = this.suctionBeams.length - 1; i >= 0; i--) {
-      const sb = this.suctionBeams[i];
-      sb.age += dt;
-      if (sb.age >= sb.life) {
-        this.suctionBeams.splice(i, 1);
+    for (let i = this.chainArcs.length - 1; i >= 0; i--) {
+      const arc = this.chainArcs[i];
+      arc.age += dt;
+      if (arc.age >= arc.life) {
+        this.chainArcs.splice(i, 1);
       }
     }
   }
@@ -1286,6 +1641,17 @@ export class StardustEngine {
       waveSpeedTier: waveCfg.speedTier,
       waveProgress: getWaveProgress(this.elapsed),
       selectedParcelId: this.selectedParcelId,
+      feverActive: this.feverTimer > 0,
+      feverTimeLeft: this.feverTimer,
+      feverDuration: FEVER_DURATION_SECONDS,
+      slowmoTimeLeft: this.slowmoTimer,
+      mission: this.mission ? { ...this.mission } : null,
+      vipOrder: this.vipOrder
+        ? {
+            ...this.vipOrder,
+            requirements: this.vipOrder.requirements.map((r) => ({ ...r })),
+          }
+        : null,
     });
   }
 
@@ -1297,7 +1663,6 @@ export class StardustEngine {
 
     ctx.save();
 
-    // Decaying trauma^2 camera shake
     if (this.trauma > 0.005) {
       const shake = this.trauma * this.trauma * 11;
       ctx.translate((Math.random() * 2 - 1) * shake, (Math.random() * 2 - 1) * shake);
@@ -1306,29 +1671,25 @@ export class StardustEngine {
     this.renderSpaceBackdrop(ctx, width, height);
     this.renderConveyorBelt(ctx);
     this.renderCargoBays(ctx);
-    this.renderSuctionBeams(ctx);
+    this.renderChainArcs(ctx);
     this.renderParcels(ctx);
-    this.renderFlyingParcels(ctx);
+    this.renderFlyTrails(ctx);
     this.renderLaunchCrates(ctx);
     this.renderDraggedParcel(ctx);
     this.renderParticles(ctx);
     this.renderFloatingTexts(ctx);
 
-    // Subtle high-combo aurora edge glow (grows brighter with combo!)
-    if (this.phase === 'playing' && this.combo >= 4) {
-      const edgeAlpha = Math.min(0.24, (this.combo - 3) * 0.022);
-      const grad = ctx.createRadialGradient(
-        width * 0.5,
-        height * 0.5,
-        Math.min(width, height) * 0.34,
-        width * 0.5,
-        height * 0.5,
-        Math.max(width, height) * 0.72
-      );
-      grad.addColorStop(0, 'rgba(0,0,0,0)');
-      grad.addColorStop(1, `rgba(255, 209, 102, ${edgeAlpha})`);
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, width, height);
+    // Fever golden-prismatic frame edge shimmer
+    if (this.phase === 'playing' && this.feverTimer > 0) {
+      const pulse = 0.25 + Math.sin(this.animTime * 12) * 0.1;
+      ctx.strokeStyle = `rgba(255, 209, 102, ${pulse + 0.35})`;
+      ctx.lineWidth = 8;
+      ctx.strokeRect(4, 4, width - 8, height - 8);
+    } else if (this.phase === 'playing' && this.combo >= 4) {
+      const edgeAlpha = Math.min(0.22, (this.combo - 3) * 0.025);
+      ctx.strokeStyle = `rgba(255, 209, 102, ${edgeAlpha})`;
+      ctx.lineWidth = 5;
+      ctx.strokeRect(2.5, 2.5, width - 5, height - 5);
     }
 
     if (this.screenFlashAlpha > 0.005) {
@@ -1349,7 +1710,6 @@ export class StardustEngine {
       ctx.fillRect(0, 0, w, h);
     }
 
-    // Multi-layer parallax twinkling stars
     for (const s of this.bgStars) {
       const drift = (this.animTime * (0.0025 + s.layer * 0.003)) % 1;
       const sx = ((s.x + drift) % 1) * w;
@@ -1367,31 +1727,38 @@ export class StardustEngine {
     const beltW = beltRight - beltLeft;
     const top = beltY - beltHeight * 0.5;
     const waveCfg = getWaveForElapsed(this.phase === 'title' ? 0 : this.elapsed);
-    const railColor = waveCfg.railColor;
+    const railColor =
+      this.feverTimer > 0
+        ? '#FFE066'
+        : this.slowmoTimer > 0
+          ? '#7DD3FC'
+          : waveCfg.railColor;
 
     ctx.save();
 
-    // Belt outer dock frame
     this.roundRect(ctx, beltLeft - 10, top - 6, beltW + 20, beltHeight + 12, 20);
     ctx.fillStyle = 'rgba(15, 24, 50, 0.94)';
     ctx.fill();
-    ctx.strokeStyle = 'rgba(148, 185, 255, 0.22)';
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = this.feverTimer > 0 ? 'rgba(255, 224, 102, 0.55)' : 'rgba(148, 185, 255, 0.22)';
+    ctx.lineWidth = this.feverTimer > 0 ? 2.5 : 1.5;
     ctx.stroke();
 
-    // Inner track recess
     this.roundRect(ctx, beltLeft, top + 6, beltW, beltHeight - 12, 14);
-    ctx.fillStyle = '#090F24';
+    ctx.fillStyle = this.slowmoTimer > 0 ? '#071B30' : '#090F24';
     ctx.fill();
 
-    // Clip animated directional chevrons inside track
     ctx.save();
     this.roundRect(ctx, beltLeft, top + 6, beltW, beltHeight - 12, 14);
     ctx.clip();
 
     const step = 46;
     const offset = this.beltScroll % step;
-    ctx.strokeStyle = 'rgba(148, 185, 255, 0.14)';
+    ctx.strokeStyle =
+      this.feverTimer > 0
+        ? 'rgba(255, 224, 102, 0.28)'
+        : this.slowmoTimer > 0
+          ? 'rgba(125, 211, 252, 0.26)'
+          : 'rgba(148, 185, 255, 0.14)';
     ctx.lineWidth = 2.5;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
@@ -1404,23 +1771,21 @@ export class StardustEngine {
       ctx.stroke();
     }
 
-    // Left warp entry glow
     const entryGrad = ctx.createLinearGradient(beltLeft, 0, beltLeft + 52, 0);
     entryGrad.addColorStop(0, `${railColor}66`);
     entryGrad.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = entryGrad;
     ctx.fillRect(beltLeft, top + 6, 52, beltHeight - 12);
 
-    // Right danger/exit chute glow
+    const exitAlpha = this.exitFlashTimer > 0 ? 0.65 : 0.34;
     const exitGrad = ctx.createLinearGradient(beltRight - 58, 0, beltRight, 0);
     exitGrad.addColorStop(0, 'rgba(0,0,0,0)');
-    exitGrad.addColorStop(1, 'rgba(255, 77, 109, 0.34)');
+    exitGrad.addColorStop(1, `rgba(255, 77, 109, ${exitAlpha})`);
     ctx.fillStyle = exitGrad;
     ctx.fillRect(beltRight - 58, top + 6, 58, beltHeight - 12);
 
     ctx.restore();
 
-    // Glowing top & bottom guide rails tinted by current wave speed tier
     ctx.strokeStyle = railColor;
     ctx.lineWidth = 2.5;
     ctx.beginPath();
@@ -1430,7 +1795,6 @@ export class StardustEngine {
     ctx.lineTo(beltRight - 14, top + beltHeight - 4);
     ctx.stroke();
 
-    // Entry & exit gate caps
     ctx.fillStyle = '#19274F';
     this.roundRect(ctx, beltLeft - 14, top - 2, 16, beltHeight + 4, 6);
     ctx.fill();
@@ -1438,11 +1802,11 @@ export class StardustEngine {
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    ctx.fillStyle = '#2B1733';
+    ctx.fillStyle = this.exitFlashTimer > 0 ? '#681531' : '#2B1733';
     this.roundRect(ctx, beltRight - 2, top - 2, 16, beltHeight + 4, 6);
     ctx.fill();
     ctx.strokeStyle = '#FF4D6D';
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = this.exitFlashTimer > 0 ? 2.5 : 1.5;
     ctx.stroke();
 
     ctx.restore();
@@ -1464,74 +1828,93 @@ export class StardustEngine {
       const isValidTarget = activeDragKind !== null && canAcceptParcel(bay.color, activeDragKind);
       const isHovered = this.drag?.isDragging && this.drag.hoverBayIndex === i;
       const isDimmed = activeDragKind !== null && !isValidTarget;
+      const isAlmostPack = bay.items.length === 2 && bay.packFuse === null;
+      const isVipTarget = Boolean(
+        this.vipOrder &&
+          !this.vipOrder.completed &&
+          this.vipOrder.requirements.some((req) => req.color === bay.color && req.done < req.needed)
+      );
 
       ctx.save();
       if (isDimmed) {
-        ctx.globalAlpha = 0.58;
+        ctx.globalAlpha = 0.56;
       }
 
-      // Reject shake offset
       const rejectShake = bay.rejectTimer > 0 ? Math.sin(bay.rejectTimer * 52) * 5 : 0;
       const rx = r.x + rejectShake;
       const ry = r.y;
 
-      // Lightweight outer highlight ring (replaces expensive shadowBlur)
-      if ((isHovered && isValidTarget) || isValidTarget || bay.packFuse !== null) {
+      // Pulsing highlight when 2/3 almost ready, hovered, valid target, or VIP requested
+      if ((isHovered && isValidTarget) || isValidTarget || bay.packFuse !== null || isAlmostPack) {
+        const pulseAlpha = isAlmostPack ? 0.35 + Math.sin(this.animTime * 8) * 0.22 : 0.42;
         this.roundRect(ctx, rx - 3, ry - 3, r.w + 6, r.h + 6, isCompact ? 18 : 22);
-        ctx.strokeStyle = isHovered && isValidTarget ? `${spec.primary}66` : `${spec.primary}34`;
-        ctx.lineWidth = isHovered && isValidTarget ? 6 : 4;
+        ctx.strokeStyle =
+          isHovered && isValidTarget
+            ? `${spec.primary}88`
+            : isAlmostPack
+              ? `rgba(255, 224, 102, ${pulseAlpha})`
+              : `${spec.primary}44`;
+        ctx.lineWidth = isHovered && isValidTarget ? 6 : isAlmostPack ? 5 : 4;
         ctx.stroke();
       }
 
-      // Bay chassis card (world-matched orbital dock frame)
       this.roundRect(ctx, rx, ry, r.w, r.h, isCompact ? 16 : 20);
       if (bay.rejectTimer > 0) {
         ctx.fillStyle = 'rgba(72, 16, 36, 0.94)';
       } else if (isHovered && isValidTarget) {
         ctx.fillStyle = 'rgba(24, 40, 80, 0.96)';
+      } else if (isAlmostPack) {
+        ctx.fillStyle = 'rgba(20, 33, 66, 0.94)';
       } else {
         ctx.fillStyle = 'rgba(13, 22, 47, 0.92)';
       }
       ctx.fill();
 
-      // Colored structural border
       ctx.strokeStyle =
         bay.rejectTimer > 0
           ? '#FF4D6D'
           : isHovered && isValidTarget
             ? '#FFFFFF'
-            : isValidTarget || bay.packFuse !== null
-              ? spec.bright
-              : `${spec.primary}75`;
-      ctx.lineWidth = isHovered && isValidTarget ? 3 : isValidTarget || bay.packFuse !== null ? 2.2 : 1.5;
+            : isAlmostPack
+              ? '#FFE066'
+              : isValidTarget || bay.packFuse !== null
+                ? spec.bright
+                : `${spec.primary}75`;
+      ctx.lineWidth =
+        isHovered && isValidTarget ? 3 : isAlmostPack || isValidTarget || bay.packFuse !== null ? 2.4 : 1.5;
       ctx.stroke();
 
       // Top color accent header strip
-      const headerH = isCompact ? 46 : 54;
+      const headerH = isCompact ? 44 : 52;
       ctx.save();
       this.roundRect(ctx, rx + 2, ry + 2, r.w - 4, headerH, isCompact ? 14 : 17);
-      ctx.fillStyle = `${spec.primary}20`;
+      ctx.fillStyle = `${spec.primary}22`;
       ctx.fill();
       ctx.restore();
 
-      // Shape emblem + Bay Chinese label + Hotkey hint (non-hue-only affordance!)
-      const iconR = isCompact ? 10 : 12;
-      drawBayIcon(ctx, rx + (isCompact ? 18 : 24), ry + headerH * 0.5, iconR, bay.color);
+      // Shape emblem + Bay Chinese label + Hotkey / VIP cue
+      const iconR = isCompact ? 9.5 : 12;
+      drawBayIcon(ctx, rx + (isCompact ? 16 : 24), ry + headerH * 0.5, iconR, bay.color);
 
       ctx.fillStyle = '#F5F8FF';
       ctx.font = `700 ${isCompact ? 13 : 16}px "Noto Sans SC", sans-serif`;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
-      ctx.fillText(isCompact ? spec.shortLabel : spec.name, rx + (isCompact ? 34 : 44), ry + headerH * 0.5);
+      ctx.fillText(isCompact ? spec.shortLabel : spec.name, rx + (isCompact ? 31 : 44), ry + headerH * 0.5);
 
-      if (!isCompact) {
+      if (isVipTarget) {
+        ctx.fillStyle = '#FFE066';
+        ctx.font = `800 ${isCompact ? 10 : 12}px "JetBrains Mono", sans-serif`;
+        ctx.textAlign = 'right';
+        ctx.fillText('VIP×3', rx + r.w - (isCompact ? 8 : 14), ry + headerH * 0.5);
+      } else if (!isCompact) {
         ctx.fillStyle = 'rgba(203, 213, 240, 0.55)';
         ctx.font = `700 12px "JetBrains Mono", monospace`;
         ctx.textAlign = 'right';
         ctx.fillText(`[${spec.hotkey}]`, rx + r.w - 14, ry + headerH * 0.5);
       }
 
-      // Draw 3 core empty socket guides (bottom -> top) so row alignment is unmistakable
+      // Draw 3 core empty socket guides
       const slotRadius = Math.min(this.layout.parcelRadius * 0.78, (r.w - 22) * 0.34);
       for (let s = 0; s < 3; s++) {
         const pos = this.getBaySlotCenter(i, s);
@@ -1549,9 +1932,12 @@ export class StardustEngine {
         ctx.restore();
       }
 
-      // Draw placed parcels inside the bay
+      // Draw placed parcels inside the bay (skip if its brief visual flight trail is still in mid-air)
       for (let s = 0; s < bay.items.length; s++) {
         const item = bay.items[s];
+        const stillFlying = this.flyTrails.some((f) => f.targetParcelId === item.id);
+        if (stillFlying) continue;
+
         const pos = this.getBaySlotCenter(i, s);
         const ease = 1 - Math.pow(1 - item.pop, 3);
         const popScale = 0.65 + ease * 0.35 + (bay.packFuse !== null ? Math.sin(this.animTime * 22) * 0.04 : 0);
@@ -1561,13 +1947,33 @@ export class StardustEngine {
           y: pos.y,
           radius: slotRadius * (s >= 3 ? 0.82 : 0.98),
           kind: item.sourceKind,
+          isGolden5x: item.isGolden5x,
           time: this.animTime,
           scaleX: popScale,
           scaleY: popScale,
         });
       }
 
-      // Auto-pack launch fuse bar at bottom of bay when 3+ parcels are locked in
+      // Pulsing "再1个就打包！" banner right above the bay when at 2/3!
+      if (isAlmostPack && this.phase === 'playing') {
+        const bob = Math.sin(this.animTime * 8) * 2.5;
+        const badgeW = Math.min(r.w + 4, isCompact ? 86 : 118);
+        const badgeH = 22;
+        const bx = rx + (r.w - badgeW) * 0.5;
+        const by = ry - 27 + bob;
+
+        this.roundRect(ctx, bx, by, badgeW, badgeH, 8);
+        ctx.fillStyle = '#FFB703';
+        ctx.fill();
+
+        ctx.fillStyle = '#090F24';
+        ctx.font = `800 ${isCompact ? 10 : 12}px "Noto Sans SC", sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('再1个就打包！', rx + r.w * 0.5, by + badgeH * 0.5 + 0.5);
+      }
+
+      // Footer: fuse bar or 0/3 counter
       const footerY = ry + r.h - 14;
       if (bay.packFuse !== null) {
         const prog = 1 - Math.max(0, bay.packFuse) / PACK_FUSE_SECONDS;
@@ -1580,19 +1986,21 @@ export class StardustEngine {
         this.roundRect(ctx, rx + 10, footerY - 3, Math.max(6, barW * prog), 6, 3);
         ctx.fill();
       } else {
-        // Quiet numeric progress readout (e.g. 2/3)
-        ctx.fillStyle = bay.items.length > 0 ? spec.bright : 'rgba(148, 163, 200, 0.52)';
+        ctx.fillStyle = isAlmostPack
+          ? '#FFE066'
+          : bay.items.length > 0
+            ? spec.bright
+            : 'rgba(148, 163, 200, 0.52)';
         ctx.font = `700 12px "JetBrains Mono", monospace`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText(`${bay.items.length}/3`, rx + r.w * 0.5, footerY);
       }
 
-      // Launch flash glow overlay
       if (bay.launchPulse > 0.02) {
         this.roundRect(ctx, rx, ry, r.w, r.h, isCompact ? 16 : 20);
         ctx.fillStyle = spec.bright;
-        ctx.globalAlpha = bay.launchPulse * 0.32;
+        ctx.globalAlpha = bay.launchPulse * 0.34;
         ctx.fill();
       }
 
@@ -1614,22 +2022,23 @@ export class StardustEngine {
         y: pos.y,
         radius: r,
         kind: p.kind,
+        isGolden5x: p.isGolden5x,
         time: this.animTime,
-        scaleX: p.scaleX * pop * (isSelected ? 1.12 : 1),
-        scaleY: p.scaleY * pop * (isSelected ? 1.12 : 1),
+        scaleX: p.scaleX * pop * (isSelected ? 1.14 : 1),
+        scaleY: p.scaleY * pop * (isSelected ? 1.14 : 1),
         selected: isSelected,
         dangerProgress: danger,
       });
     }
   }
 
-  private renderFlyingParcels(ctx: CanvasRenderingContext2D): void {
-    const r = this.layout.parcelRadius * 0.92;
-    for (const f of this.flyingParcels) {
+  private renderFlyTrails(ctx: CanvasRenderingContext2D): void {
+    const r = this.layout.parcelRadius * 0.9;
+    for (const f of this.flyTrails) {
       const t = Math.min(1, f.t);
       const ease = 1 - Math.pow(1 - t, 3);
       const x = f.startX + (f.targetX - f.startX) * ease;
-      const arcLift = Math.sin(t * Math.PI) * 34;
+      const arcLift = Math.sin(t * Math.PI) * 32;
       const y = f.startY + (f.targetY - f.startY) * ease - arcLift;
 
       drawParcelSprite(ctx, {
@@ -1637,8 +2046,9 @@ export class StardustEngine {
         y,
         radius: r,
         kind: f.kind,
+        isGolden5x: f.isGolden5x,
         time: this.animTime,
-        scaleX: 1.08,
+        scaleX: 1.06,
         scaleY: 0.94,
       });
     }
@@ -1646,11 +2056,9 @@ export class StardustEngine {
 
   private renderDraggedParcel(ctx: CanvasRenderingContext2D): void {
     if (!this.drag || !this.drag.isDragging) return;
-    const { currX, currY, kind, hoverBayIndex } = this.drag;
-    // Slight upward finger offset on compact touch screens so thumb doesn't occlude the parcel
+    const { currX, currY, kind, isGolden5x, hoverBayIndex } = this.drag;
     const drawY = this.layout.isCompact ? currY - 26 : currY;
 
-    // Glowing magnetic guide tether to hovered valid bay
     if (hoverBayIndex !== null && canAcceptParcel(this.bays[hoverBayIndex].color, kind)) {
       const target = this.layout.bayRects[hoverBayIndex];
       const spec = BAY_SPEC_MAP[this.bays[hoverBayIndex].color];
@@ -1670,6 +2078,7 @@ export class StardustEngine {
       y: drawY,
       radius: this.layout.parcelRadius * 1.14,
       kind,
+      isGolden5x,
       time: this.animTime,
       selected: true,
     });
@@ -1684,7 +2093,6 @@ export class StardustEngine {
       ctx.globalAlpha = alpha;
       ctx.translate(c.x, c.y);
 
-      // Thruster flame cone
       const flameH = 38 + Math.random() * 18;
       const flameGrad = ctx.createLinearGradient(0, 12, 0, 12 + flameH);
       flameGrad.addColorStop(0, '#FFFFFF');
@@ -1698,7 +2106,6 @@ export class StardustEngine {
       ctx.closePath();
       ctx.fill();
 
-      // Packed star shipping capsule
       this.roundRect(ctx, -26, -24, 52, 42, 12);
       ctx.fillStyle = spec.primary;
       ctx.fill();
@@ -1706,7 +2113,6 @@ export class StardustEngine {
       ctx.lineWidth = 2.5;
       ctx.stroke();
 
-      // Center emblem
       traceShapePath(ctx, spec.shape, 12);
       ctx.fillStyle = '#FFFFFF';
       ctx.fill();
@@ -1715,27 +2121,24 @@ export class StardustEngine {
     }
   }
 
-  private renderSuctionBeams(ctx: CanvasRenderingContext2D): void {
-    for (const sb of this.suctionBeams) {
-      const prog = sb.age / sb.life;
+  private renderChainArcs(ctx: CanvasRenderingContext2D): void {
+    for (const arc of this.chainArcs) {
+      const prog = arc.age / arc.life;
       const alpha = 1 - prog;
       ctx.save();
       ctx.globalAlpha = alpha;
-      ctx.strokeStyle = '#C084FC';
-      ctx.lineWidth = 5 * (1 - prog * 0.6);
+      ctx.strokeStyle = arc.color;
+      ctx.lineWidth = 6 * (1 - prog * 0.5);
       ctx.lineCap = 'round';
       ctx.beginPath();
-      ctx.moveTo(sb.fromX, sb.fromY);
-      ctx.lineTo(sb.toX, sb.toY);
+      ctx.moveTo(arc.fromX, arc.fromY);
+      ctx.quadraticCurveTo(
+        (arc.fromX + arc.toX) * 0.5,
+        Math.min(arc.fromY, arc.toY) - 42,
+        arc.toX,
+        arc.toY
+      );
       ctx.stroke();
-
-      // Sucked orb traveling along beam
-      const ox = sb.fromX + (sb.toX - sb.fromX) * prog;
-      const oy = sb.fromY + (sb.toY - sb.fromY) * prog;
-      ctx.fillStyle = sb.color;
-      ctx.beginPath();
-      ctx.arc(ox, oy, 10 * (1 - prog * 0.5), 0, Math.PI * 2);
-      ctx.fill();
       ctx.restore();
     }
   }

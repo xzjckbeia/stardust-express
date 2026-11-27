@@ -74,8 +74,9 @@ export function traceShapePath(ctx: CanvasRenderingContext2D, shape: ParcelShape
       traceStar(ctx, r * 1.1, r * 0.62, 8);
       break;
     case 'vortex':
+    case 'clock':
       ctx.beginPath();
-      ctx.arc(0, 0, r * 0.92, 0, Math.PI * 2);
+      ctx.arc(0, 0, r * 0.94, 0, Math.PI * 2);
       break;
   }
 }
@@ -90,6 +91,7 @@ export interface DrawParcelOptions {
   scaleY?: number;
   rotation?: number;
   selected?: boolean;
+  isGolden5x?: boolean;
   /** 0..1 urgency for black hole approaching eruption */
   dangerProgress?: number;
   /** 0..1 opacity override */
@@ -107,6 +109,7 @@ export function drawParcelSprite(ctx: CanvasRenderingContext2D, opts: DrawParcel
     scaleY = 1,
     rotation = 0,
     selected = false,
+    isGolden5x = false,
     dangerProgress = 0,
     alpha = 1,
   } = opts;
@@ -118,6 +121,12 @@ export function drawParcelSprite(ctx: CanvasRenderingContext2D, opts: DrawParcel
 
   if (kind === 'blackhole') {
     drawBlackHoleParcel(ctx, radius, time, dangerProgress);
+    ctx.restore();
+    return;
+  }
+
+  if (kind === 'slowmo') {
+    drawSlowmoParcel(ctx, radius, time);
     ctx.restore();
     return;
   }
@@ -137,14 +146,33 @@ export function drawParcelSprite(ctx: CanvasRenderingContext2D, opts: DrawParcel
     ctx.beginPath();
     ctx.arc(0, 0, radius * 1.38, 0, Math.PI * 2);
     ctx.strokeStyle = '#FFFFFF';
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 2.6;
     ctx.setLineDash([6, 4]);
     ctx.rotate(time * 2.2);
     ctx.stroke();
     ctx.restore();
   }
 
-  // Outer luminous aura (lightweight layered halo, zero per-frame gradient allocation)
+  // Extra radiant golden shimmer halo for Wave 2+ Golden 5x parcels
+  if (isGolden5x) {
+    const gPulse = 1 + Math.sin(time * 9) * 0.1;
+    ctx.fillStyle = 'rgba(255, 215, 64, 0.24)';
+    ctx.beginPath();
+    ctx.arc(0, 0, radius * 1.65 * gPulse, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.save();
+    ctx.rotate(time * 1.6);
+    ctx.strokeStyle = '#FFE066';
+    ctx.lineWidth = 2.4;
+    ctx.setLineDash([5, 5]);
+    ctx.beginPath();
+    ctx.arc(0, 0, radius * 1.3, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Outer luminous aura (lightweight layered halo)
   ctx.fillStyle = spec.glow.replace('0.52', '0.13');
   ctx.beginPath();
   ctx.arc(0, 0, radius * 1.48 * pulse, 0, Math.PI * 2);
@@ -155,11 +183,12 @@ export function drawParcelSprite(ctx: CanvasRenderingContext2D, opts: DrawParcel
   ctx.arc(0, 0, radius * 1.16 * pulse, 0, Math.PI * 2);
   ctx.fill();
 
+  ctx.save();
   ctx.rotate(rotation);
 
   // Dark silhouette outline for crisp readability against bright starfields
   traceShapePath(ctx, spec.shape, radius * 1.05);
-  ctx.fillStyle = '#070B1A';
+  ctx.fillStyle = isGolden5x ? '#3B2500' : '#070B1A';
   ctx.fill();
 
   // Main crystalline body
@@ -171,15 +200,15 @@ export function drawParcelSprite(ctx: CanvasRenderingContext2D, opts: DrawParcel
   ctx.save();
   ctx.translate(-radius * 0.06, -radius * 0.08);
   traceShapePath(ctx, spec.shape, radius * 0.72);
-  ctx.fillStyle = spec.bright;
-  ctx.globalAlpha = alpha * 0.58;
+  ctx.fillStyle = isGolden5x ? '#FFF3B0' : spec.bright;
+  ctx.globalAlpha = alpha * (isGolden5x ? 0.72 : 0.58);
   ctx.fill();
   ctx.restore();
 
-  // Crisp luminous rim
+  // Crisp luminous rim (thick gold rim for 5x parcels)
   traceShapePath(ctx, spec.shape, radius * 0.94);
-  ctx.strokeStyle = spec.bright;
-  ctx.lineWidth = 2;
+  ctx.strokeStyle = isGolden5x ? '#FFE066' : spec.bright;
+  ctx.lineWidth = isGolden5x ? 3.2 : 2;
   ctx.stroke();
 
   // Inner facet sheen
@@ -192,8 +221,84 @@ export function drawParcelSprite(ctx: CanvasRenderingContext2D, opts: DrawParcel
   ctx.beginPath();
   ctx.arc(-radius * 0.24, -radius * 0.26, Math.max(2, radius * 0.12), 0, Math.PI * 2);
   ctx.fill();
+  ctx.restore();
+
+  // Crisp Golden "×5" badge on top-right corner
+  if (isGolden5x) {
+    const bx = radius * 0.72;
+    const by = -radius * 0.72;
+    ctx.fillStyle = '#FFD166';
+    ctx.strokeStyle = '#070B1A';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(bx, by, Math.max(10, radius * 0.36), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    ctx.fillStyle = '#090F24';
+    ctx.font = `900 ${Math.max(10, Math.round(radius * 0.38))}px "JetBrains Mono", sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('×5', bx, by + 0.5);
+  }
 
   ctx.restore();
+}
+
+function drawSlowmoParcel(ctx: CanvasRenderingContext2D, radius: number, time: number): void {
+  const pulse = 1 + Math.sin(time * 6) * 0.08;
+
+  // Icy cyan aura
+  ctx.fillStyle = 'rgba(56, 189, 248, 0.2)';
+  ctx.beginPath();
+  ctx.arc(0, 0, radius * 1.55 * pulse, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(125, 211, 252, 0.32)';
+  ctx.beginPath();
+  ctx.arc(0, 0, radius * 1.18 * pulse, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Outer icy ring
+  ctx.beginPath();
+  ctx.arc(0, 0, radius * 0.96, 0, Math.PI * 2);
+  ctx.fillStyle = '#071B34';
+  ctx.fill();
+  ctx.strokeStyle = '#7DD3FC';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  // Rotating clock/crystal ticks
+  ctx.save();
+  ctx.rotate(time * 0.8);
+  ctx.strokeStyle = 'rgba(186, 230, 253, 0.75)';
+  ctx.lineWidth = 1.8;
+  for (let i = 0; i < 6; i++) {
+    ctx.rotate(Math.PI / 3);
+    ctx.beginPath();
+    ctx.moveTo(0, -radius * 0.62);
+    ctx.lineTo(0, -radius * 0.84);
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // Clock hands
+  ctx.strokeStyle = '#FFFFFF';
+  ctx.lineWidth = 2.6;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(0, -radius * 0.44);
+  ctx.moveTo(0, 0);
+  ctx.lineTo(radius * 0.34, radius * 0.16);
+  ctx.stroke();
+
+  // Crisp label
+  ctx.fillStyle = '#E0F2FE';
+  ctx.font = `800 ${Math.max(10, Math.round(radius * 0.36))}px "Noto Sans SC", sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('减速', 0, radius * 0.56);
 }
 
 function drawRainbowParcel(

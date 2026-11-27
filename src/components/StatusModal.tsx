@@ -39,7 +39,7 @@ export const StatusModal: React.FC<StatusModalProps> = ({
         return;
       }
     } catch {
-      // User dismissed native share or unsupported; fall back to clipboard
+      // Fall back to clipboard
     }
 
     try {
@@ -49,7 +49,7 @@ export const StatusModal: React.FC<StatusModalProps> = ({
         return;
       }
     } catch {
-      // Clipboard blocked in restricted iframe; show selectable preview card
+      // Clipboard blocked in restricted iframe
     }
 
     setShareFeedback('preview');
@@ -95,7 +95,6 @@ export const StatusModal: React.FC<StatusModalProps> = ({
     );
   }
 
-  // Game Over / 90s Results Modal
   const safeSummary: RunSummary = summary ?? {
     score: 0,
     maxCombo: 0,
@@ -106,6 +105,10 @@ export const StatusModal: React.FC<StatusModalProps> = ({
     isNewBestCombo: false,
     rankTitle: '星港见习员',
     rankSubtitle: '熟悉传送带节奏，下局一定更高分',
+    nextRank: { nextTitle: '星际快递员', nextThreshold: 1200, pointsNeeded: 1200 },
+    missionCompleted: false,
+    missionLabel: '',
+    vipCompletedCount: 0,
   };
 
   return (
@@ -122,10 +125,17 @@ export const StatusModal: React.FC<StatusModalProps> = ({
             {safeSummary.rankTitle}
           </h2>
           <p className="mt-1 text-sm text-sky-200/75">{safeSummary.rankSubtitle}</p>
+
+          {/* Points remaining to next courier rank */}
+          <p className="mt-2 text-xs sm:text-sm font-num text-amber-200/95">
+            {safeSummary.nextRank
+              ? `距离下一称号「${safeSummary.nextRank.nextTitle}」还差 ${safeSummary.nextRank.pointsNeeded} 分`
+              : '已达成最高称号「银河特快传奇」！'}
+          </p>
         </div>
 
         {/* 3 Clean Tabular Stat Tiles */}
-        <div className="mt-5 grid grid-cols-3 gap-2.5">
+        <div className="mt-4 grid grid-cols-3 gap-2.5">
           <div className="rounded-xl bg-[#13204A] border border-sky-300/15 p-3 text-center">
             <div className="text-xs text-sky-300/75">本局得分</div>
             <div className="mt-1 font-num font-extrabold text-xl sm:text-2xl text-[#FFD166]">
@@ -158,11 +168,15 @@ export const StatusModal: React.FC<StatusModalProps> = ({
         </div>
 
         {/* Quiet unboxed breakdown line */}
-        <div className="mt-3.5 text-center text-xs text-sky-200/75 font-num">
+        <div className="mt-3 text-center text-xs text-sky-200/80 font-num">
           发出包裹 {safeSummary.packedParcels} 件 · 清除黑洞 {safeSummary.blackholesCleared} 个
+          {safeSummary.vipCompletedCount > 0 ? ` · VIP急单 ${safeSummary.vipCompletedCount} 次` : ''}
+          {safeSummary.missionLabel
+            ? ` · ${safeSummary.missionCompleted ? '本局任务已达成' : '本局任务未完成'}`
+            : ''}
         </div>
 
-        {/* Share feedback / copyable战报 box */}
+        {/* Share feedback / copyable battle report */}
         {shareFeedback !== 'idle' && (
           <div className="mt-4 rounded-xl bg-[#080F24] border border-emerald-400/35 p-3 text-left">
             <div className="text-xs font-bold text-emerald-300 mb-1.5">

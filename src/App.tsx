@@ -9,6 +9,7 @@ import { StatusModal } from './components/StatusModal';
 import { TitleOverlay } from './components/TitleOverlay';
 import { StardustEngine } from './game/engine';
 import {
+  FEVER_DURATION_SECONDS,
   ROUND_DURATION_SECONDS,
   loadRecords,
   mergeAndSaveRecords,
@@ -31,7 +32,22 @@ const INITIAL_HUD: HudSnapshot = {
   waveSpeedTier: '1档',
   waveProgress: 0,
   selectedParcelId: null,
+  feverActive: false,
+  feverTimeLeft: 0,
+  feverDuration: FEVER_DURATION_SECONDS,
+  slowmoTimeLeft: 0,
+  mission: null,
+  vipOrder: null,
 };
+
+declare global {
+  interface Window {
+    __STARDUST_INSPECT__?: () => ReturnType<StardustEngine['getDebugSnapshot']> & {
+      bgmActive: boolean;
+      audioState: string;
+    };
+  }
+}
 
 function readUrlOptions(): { autostart: boolean; customDuration?: number } {
   if (typeof window === 'undefined') return { autostart: false };
@@ -148,6 +164,11 @@ export default function App() {
     });
 
     engineRef.current = engine;
+    window.__STARDUST_INSPECT__ = () => ({
+      ...engine.getDebugSnapshot(),
+      bgmActive: Boolean(soundRef.current?.isBgmActive()),
+      audioState: soundRef.current?.getAudioState() ?? 'none',
+    });
 
     const opts = readUrlOptions();
     if (opts.autostart) {
@@ -158,6 +179,7 @@ export default function App() {
     }
 
     return () => {
+      delete window.__STARDUST_INSPECT__;
       if (bannerTimerRef.current !== null) {
         window.clearTimeout(bannerTimerRef.current);
       }

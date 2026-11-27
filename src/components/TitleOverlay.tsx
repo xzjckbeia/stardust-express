@@ -130,7 +130,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
             <svg viewBox="0 0 20 20" className="w-3.5 h-3.5 shrink-0" aria-hidden="true">
               <circle cx="10" cy="10" r="7" fill="#0B0418" stroke="#E879F9" strokeWidth="2.4" />
             </svg>
-            急点黑洞防吸货
+            急点黑洞防断连扣分
           </span>
         </div>
 

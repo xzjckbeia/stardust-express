@@ -2,9 +2,9 @@ export type GamePhase = 'title' | 'playing' | 'paused' | 'gameover';
 
 export type ParcelColor = 'gold' | 'coral' | 'cyan' | 'emerald';
 
-export type ParcelKind = ParcelColor | 'rainbow' | 'blackhole';
+export type ParcelKind = ParcelColor | 'rainbow' | 'blackhole' | 'slowmo';
 
-export type ParcelShape = 'star' | 'diamond' | 'hexagon' | 'triangle' | 'prism' | 'vortex';
+export type ParcelShape = 'star' | 'diamond' | 'hexagon' | 'triangle' | 'prism' | 'vortex' | 'clock';
 
 export interface BaySpec {
   id: ParcelColor;
@@ -84,6 +84,10 @@ export interface WaveConfig {
   rainbowChance: number;
   /** Probability of black hole parcel */
   blackholeChance: number;
+  /** Probability of golden 5x bonus parcel (Wave 2+) */
+  golden5xChance: number;
+  /** Probability of slow-mo powerup parcel (Wave 3) */
+  slowmoChance: number;
   /** Accent hex color for conveyor rails */
   railColor: string;
 }
@@ -91,6 +95,7 @@ export interface WaveConfig {
 export interface BaySlotItem {
   id: number;
   sourceKind: ParcelColor | 'rainbow';
+  isGolden5x?: boolean;
   /** 0..1 pop-in animation progress */
   pop: number;
 }
@@ -104,6 +109,33 @@ export interface BayState {
   flashTimer: number;
   rejectTimer: number;
   launchPulse: number;
+}
+
+export type MissionType = 'pack' | 'blackhole' | 'score';
+
+export interface MissionState {
+  id: string;
+  type: MissionType;
+  label: string;
+  target: number;
+  current: number;
+  reward: number;
+  completed: boolean;
+}
+
+export interface VipRequirement {
+  color: ParcelColor;
+  needed: number;
+  done: number;
+}
+
+export interface VipOrderState {
+  id: number;
+  requirements: VipRequirement[];
+  timeLeft: number;
+  duration: number;
+  multiplier: number;
+  completed: boolean;
 }
 
 export interface HudSnapshot {
@@ -121,6 +153,12 @@ export interface HudSnapshot {
   waveSpeedTier: string;
   waveProgress: number;
   selectedParcelId: number | null;
+  feverActive: boolean;
+  feverTimeLeft: number;
+  feverDuration: number;
+  slowmoTimeLeft: number;
+  mission: MissionState | null;
+  vipOrder: VipOrderState | null;
 }
 
 export interface StoredRecords {
@@ -128,6 +166,12 @@ export interface StoredRecords {
   bestMaxCombo: number;
   totalPackedAllTime: number;
   gamesPlayed: number;
+}
+
+export interface NextRankProgress {
+  nextTitle: string;
+  nextThreshold: number;
+  pointsNeeded: number;
 }
 
 export interface RunSummary {
@@ -140,4 +184,8 @@ export interface RunSummary {
   isNewBestCombo: boolean;
   rankTitle: string;
   rankSubtitle: string;
+  nextRank: NextRankProgress | null;
+  missionCompleted: boolean;
+  missionLabel: string;
+  vipCompletedCount: number;
 }
